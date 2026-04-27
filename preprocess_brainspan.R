@@ -4,108 +4,121 @@ library(tidyr)
 library(readr)
 library(tibble)
 
-# Load dataset(s)
-brainspan_matrix <- read_csv("/N/slate/annaum/data/transcriptomics/BrainSpan_RNAseq_v10/expression_matrix.csv",
-                             col_names = FALSE,
-                             show_col_types = FALSE)
+# Load datasets
+brainspan_matrix <- read_csv(
+  "data/BrainSpan_RNAseq_v10/expression_matrix.csv",
+  col_names = FALSE,
+  show_col_types = FALSE
+)
 
-brainspan_columns <- read_csv("/N/slate/annaum/data/transcriptomics/BrainSpan_RNAseq_v10/columns_metadata.csv",
-                              show_col_types = FALSE)
+brainspan_columns <- read_csv(
+  "data/BrainSpan_RNAseq_v10/columns_metadata.csv",
+  show_col_types = FALSE
+)
 
-brainspan_rows <- read_csv("/N/slate/annaum/data/transcriptomics/BrainSpan_RNAseq_v10/rows_metadata.csv",
-                           show_col_types = FALSE)
+brainspan_rows <- read_csv(
+  "data/BrainSpan_RNAseq_v10/rows_metadata.csv",
+  show_col_types = FALSE
+)
 
-# Figure out number of subjects
-unique_subjects <- unique(brainspan_columns$donor_id)
-num_unique_subjects <- length(unique_subjects)
+# Fix expression matrix
+# First column in expression_matrix.csv is gene_id
+colnames(brainspan_matrix)[1] <- "gene_id"
 
-print(num_unique_subjects) # gives us 42 subjects in total
+# All other columns are samples
+sample_ids <- as.character(brainspan_columns$column_num)
+colnames(brainspan_matrix)[-1] <- sample_ids
 
-## Separate the matrix to be person, time, and region specific
+# Attach gene metadata 
+brainspan_rows_small <- brainspan_rows %>%
+  select(gene_id, ensembl_gene_id, gene_symbol)
 
-# need to remove a column from the matrix dataset (525 columns total)
-# because brainspan_columns has 524 samples
-brainspan_matrix <- brainspan_matrix[, -1] # removes first column (index column)
+expr_annot <- brainspan_rows_small %>%
+  right_join(brainspan_matrix, by = "gene_id")
 
-# convert matrix to dataframe, tibble causes a warning message
-brainspan_matrix <- as.data.frame(brainspan_matrix)
+# Keep only valid Ensembl IDs
+expr_annot <- expr_annot %>% filter(!is.na(ensembl_gene_id))
 
-# assign names to matrix & columns
-colnames(brainspan_matrix) <- brainspan_columns$column_num
-rownames(brainspan_matrix) <- brainspan_rows$ensembl_gene_id
+# Make expression numeric
+expr_cols <- sample_ids
+expr_annot[expr_cols] <- lapply(expr_annot[expr_cols], as.numeric)
 
-# check distribution of raw expression values
-hist(as.numeric(unlist(brainspan_matrix)),
-     breaks = 100,
-     main = "Distribution of Raw Expression Values",
-     xlab = "Expression Level")
+# Log transform
+expr_annot[expr_cols] <- log1p(as.matrix(expr_annot[expr_cols]))
 
-# log transformation (only done once)
-brainspan_matrix <- log1p(brainspan_matrix)
+# Remove genes with zero expression
+gene_sums <- rowSums(expr_annot[expr_cols], na.rm = TRUE)
+expr_annot <- expr_annot[gene_sums > 0, ]
 
-# check distribution after log transformation
-hist(as.numeric(unlist(brainspan_matrix)),
-     breaks = 100,
-     main = "Distribution of Log-Transformed Expression Values",
-     xlab = "Expression Level")
+# Clean metadata
+brainspan_columns_processed <- brainspan_columns %>%
+  mutate(
+    sample_id = as.character(column_num),
+    region = structure_name,
+    donor_id = as.character(donor_id)
+  )
 
-# clean metadata + create useful columns
-brainspan_columns <- brainspan_columns %>%
-  mutate(sample_id = as.character(column_num),
-         person = donor_id,
-         time = age,
-         region = structure_name,
-         period = case_when(
-           grepl("pcw", time) ~ "Prenatal",
-           grepl("mos|yrs", time) & as.numeric(gsub("[^0-9]", "", time)) < 24 ~ "Infant",
-           TRUE ~ "Child/Adult"
-         ))
-
-## For each region and time period, calculate the SD (variance) of each gene across the 42 people
-
-# 1. Convert matrix to long format and join metadata
-long_df <- brainspan_matrix %>%
-  rownames_to_column("ensembl_gene_id") %>%
+# Long format
+long_df <- expr_annot %>%
+  select(ensembl_gene_id, all_of(expr_cols)) %>%
   pivot_longer(
-    cols = -ensembl_gene_id,
+    cols = all_of(expr_cols),
     names_to = "sample_id",
     values_to = "expression"
   ) %>%
-  left_join(brainspan_columns %>%
-              select(sample_id, person, region, time, period),
-            by = "sample_id")
+  left_join(
+    brainspan_columns_processed %>%
+      select(sample_id, region, donor_id),
+    by = "sample_id"
+  )
 
-# 2. Compute SD across people for each gene and region
-group_by_sd_region <- long_df %>%
-  group_by(ensembl_gene_id, region) %>%
-  summarize(
-    mean_expression = mean(expression, na.rm = TRUE),
-    sd_expression   = sd(expression, na.rm = TRUE),
-    var_expression  = var(expression, na.rm = TRUE),
-    n               = n(), # number of samples per region
-    n_donors        = n_distinct(person)
+# Filter regions with at least 2 donors
+region_donor_counts <- long_df %>%
+  group_by(region) %>%
+  summarise(n_donors = n_distinct(donor_id), .groups = "drop")
+
+valid_regions <- region_donor_counts %>%
+  filter(n_donors >= 2) %>%
+  pull(region)
+
+long_df <- long_df %>%
+  filter(region %in% valid_regions)
+
+# SD per gene per region
+gene_sd <- long_df %>%
+  group_by(region, ensembl_gene_id) %>%
+  summarise(
+    sd_expression = sd(expression, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Z-score variability
+gene_sd_z <- gene_sd %>%
+  group_by(region) %>%
+  mutate(
+    sd_mean = mean(sd_expression, na.rm = TRUE),
+    sd_sd   = sd(sd_expression, na.rm = TRUE),
+    sd_z    = ifelse(sd_sd == 0, NA_real_,
+                     (sd_expression - sd_mean) / sd_sd)
   ) %>%
   ungroup()
 
-# 3. Extract the top 100 genes based on SD
-top_genes_sd_region <- group_by_sd_region %>%
-  group_by(region) %>%
-  arrange(desc(sd_expression)) %>%
-  slice_head(n = 100) %>%
-  ungroup()
+# Z cutoff
+z_cutoff <- 2
 
-write.csv(top_genes_sd_region,
-          "/N/slate/annaum/data/transcriptomics/logtrans_top_genes_sd_region.csv",
-          row.names = FALSE)
+hv_genes <- gene_sd_z %>%
+  filter(!is.na(sd_z), sd_z >= z_cutoff)
 
-### sum expression across all samples for each gene
-gene_sums <- rowSums(brainspan_matrix, na.rm = TRUE)
-summary(gene_sums)
+# Output directory
+out_dir <- "data/processed"
+dir.create(out_dir, showWarnings = FALSE, recursive = TRUE)
 
-hist(gene_sums,
-     breaks = 100,
-     main = "Distribution of Gene Expression Sums Across All Samples",
-     xlab = "Summed Expression per Gene")
+# Save outputs (IMPORTANT for downstream scripts)
+write_csv(hv_genes,
+          file.path(out_dir, "highlyvariable_genes_zscore_sd_ge2.csv"))
 
-sum(gene_sums == 0)
-mean(gene_sums == 0)
+saveRDS(expr_annot,
+        file.path(out_dir, "expr_annot.rds"))
+
+saveRDS(brainspan_columns_processed,
+        file.path(out_dir, "brainspan_columns_processed.rds"))
